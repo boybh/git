@@ -3754,6 +3754,21 @@ static int check_to_create(struct apply_state *state,
 			return EXISTS_IN_INDEX;
 	}
 
+	/* If the new path to be added has an intent-to-add entry, then
+	 * by definition it does not match what is in the work tree. So
+	 * "apply --index" should always fail in this case. Patches other
+	 * than creation patches are already held to this standard by
+	 * check_preimage() calling verify_index_match().
+	 */
+	if (state->check_index && !state->cached) {
+		int pos = index_name_pos(state->repo->index, new_name,
+					 strlen(new_name));
+		if (pos >= 0 &&
+		    state->repo->index->cache[pos]->ce_flags & CE_INTENT_TO_ADD)
+			return error(_("%s: does not match index"), new_name);
+	}
+
+
 	if (state->cached)
 		return 0;
 
