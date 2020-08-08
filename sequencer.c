@@ -16,7 +16,7 @@
 #include "rerere.h"
 #include "merge-recursive.h"
 #include "refs.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "quote.h"
 #include "trailer.h"
 #include "log-tree.h"
@@ -150,6 +150,8 @@ static GIT_PATH_FUNC(rebase_path_refs_to_delete, "rebase-merge/refs-to-delete")
  * command-line.
  */
 static GIT_PATH_FUNC(rebase_path_gpg_sign_opt, "rebase-merge/gpg_sign_opt")
+static GIT_PATH_FUNC(rebase_path_cdate_is_adate, "rebase-merge/cdate_is_adate")
+static GIT_PATH_FUNC(rebase_path_ignore_date, "rebase-merge/ignore_date")
 static GIT_PATH_FUNC(rebase_path_orig_head, "rebase-merge/orig-head")
 static GIT_PATH_FUNC(rebase_path_verbose, "rebase-merge/verbose")
 static GIT_PATH_FUNC(rebase_path_quiet, "rebase-merge/quiet")
@@ -830,10 +832,10 @@ finish:
 
 /*
  * Read a GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL AND GIT_AUTHOR_DATE from a
- * file with shell quoting into struct argv_array. Returns -1 on
+ * file with shell quoting into struct strvec. Returns -1 on
  * error, 0 otherwise.
  */
-static int read_env_script(struct argv_array *env)
+static int read_env_script(struct strvec *env)
 {
 	char *name, *email, *date;
 
@@ -841,9 +843,9 @@ static int read_env_script(struct argv_array *env)
 			       &name, &email, &date, 0))
 		return -1;
 
-	argv_array_pushf(env, "GIT_AUTHOR_NAME=%s", name);
-	argv_array_pushf(env, "GIT_AUTHOR_EMAIL=%s", email);
-	argv_array_pushf(env, "GIT_AUTHOR_DATE=%s", date);
+	strvec_pushf(env, "GIT_AUTHOR_NAME=%s", name);
+	strvec_pushf(env, "GIT_AUTHOR_EMAIL=%s", email);
+	strvec_pushf(env, "GIT_AUTHOR_DATE=%s", date);
 	free(name);
 	free(email);
 	free(date);
@@ -861,6 +863,40 @@ static char *get_author(const char *message)
 		return xmemdupz(a, len);
 
 	return NULL;
+}
+
+static const char *author_date_from_env_array(const struct strvec *env)
+{
+	int i;
+	const char *date;
+
+	for (i = 0; i < env->nr; i++)
+		if (skip_prefix(env->v[i],
+				"GIT_AUTHOR_DATE=", &date))
+			return date;
+	/*
+	 * If GIT_AUTHOR_DATE is missing we should have already errored out when
+	 * reading the script
+	 */
+	BUG("GIT_AUTHOR_DATE missing from author script");
+}
+
+/* Construct a free()able author string with current time as the author date */
+static char *ignore_author_date(const char *author)
+{
+	int len;
+	struct ident_split ident;
+	struct strbuf new_author = STRBUF_INIT;
+
+	if (split_ident_line(&ident, author, strlen(author)) < 0) {
+		error(_("invalid author identity: %s"), author);
+		return NULL;
+	}
+
+	len = ident.mail_end - ident.name_begin + 1;
+	strbuf_addf(&new_author, "%.*s ", len, ident.name_begin);
+	datestamp(&new_author);
+	return strbuf_detach(&new_author, NULL);
 }
 
 static const char staged_changes_advice[] =
@@ -929,34 +965,42 @@ static int run_git_commit(struct repository *r,
 			     gpg_opt, gpg_opt);
 	}
 
-	argv_array_push(&cmd.args, "commit");
+	if (opts->committer_date_is_author_date)
+		strvec_pushf(&cmd.env_array, "GIT_COMMITTER_DATE=%s",
+			     opts->ignore_date ?
+			     "" :
+			     author_date_from_env_array(&cmd.env_array));
+	if (opts->ignore_date)
+		strvec_push(&cmd.env_array, "GIT_AUTHOR_DATE=");
+
+	strvec_push(&cmd.args, "commit");
 
 	if (!(flags & VERIFY_MSG))
-		argv_array_push(&cmd.args, "-n");
+		strvec_push(&cmd.args, "-n");
 	if ((flags & AMEND_MSG))
-		argv_array_push(&cmd.args, "--amend");
+		strvec_push(&cmd.args, "--amend");
 	if (opts->gpg_sign)
-		argv_array_pushf(&cmd.args, "-S%s", opts->gpg_sign);
+		strvec_pushf(&cmd.args, "-S%s", opts->gpg_sign);
 	else
-		argv_array_push(&cmd.args, "--no-gpg-sign");
+		strvec_push(&cmd.args, "--no-gpg-sign");
 	if (defmsg)
-		argv_array_pushl(&cmd.args, "-F", defmsg, NULL);
+		strvec_pushl(&cmd.args, "-F", defmsg, NULL);
 	else if (!(flags & EDIT_MSG))
-		argv_array_pushl(&cmd.args, "-C", "HEAD", NULL);
+		strvec_pushl(&cmd.args, "-C", "HEAD", NULL);
 	if ((flags & CLEANUP_MSG))
-		argv_array_push(&cmd.args, "--cleanup=strip");
+		strvec_push(&cmd.args, "--cleanup=strip");
 	if ((flags & EDIT_MSG))
-		argv_array_push(&cmd.args, "-e");
+		strvec_push(&cmd.args, "-e");
 	else if (!(flags & CLEANUP_MSG) &&
 		 !opts->signoff && !opts->record_origin &&
 		 !opts->explicit_cleanup)
-		argv_array_push(&cmd.args, "--cleanup=verbatim");
+		strvec_push(&cmd.args, "--cleanup=verbatim");
 
 	if ((flags & ALLOW_EMPTY))
-		argv_array_push(&cmd.args, "--allow-empty");
+		strvec_push(&cmd.args, "--allow-empty");
 
 	if (!(flags & EDIT_MSG))
-		argv_array_push(&cmd.args, "--allow-empty-message");
+		strvec_push(&cmd.args, "--allow-empty-message");
 
 	if (is_rebase_i(opts) && !(flags & EDIT_MSG))
 		return run_command_silent_on_success(&cmd);
@@ -1307,7 +1351,7 @@ static int try_to_commit(struct repository *r,
 	struct commit_extra_header *extra = NULL;
 	struct strbuf err = STRBUF_INIT;
 	struct strbuf commit_msg = STRBUF_INIT;
-	char *amend_author = NULL;
+	char *author_to_free = NULL;
 	const char *hook_commit = NULL;
 	enum commit_msg_cleanup_mode cleanup;
 	int res = 0;
@@ -1329,7 +1373,7 @@ static int try_to_commit(struct repository *r,
 			strbuf_addstr(msg, orig_message);
 			hook_commit = "HEAD";
 		}
-		author = amend_author = get_author(message);
+		author = author_to_free = get_author(message);
 		unuse_commit_buffer(current_head, message);
 		if (!author) {
 			res = error(_("unable to parse commit author"));
@@ -1340,6 +1384,32 @@ static int try_to_commit(struct repository *r,
 	} else if (current_head &&
 		   (!(flags & CREATE_ROOT_COMMIT) || (flags & AMEND_MSG))) {
 		commit_list_insert(current_head, &parents);
+	}
+
+	if (opts->committer_date_is_author_date) {
+		struct ident_split ident;
+		struct strbuf date = STRBUF_INIT;
+
+		if (split_ident_line(&ident, author, (int)strlen(author)) < 0) {
+			res = error(_("malformed ident line '%s'"), author);
+			goto out;
+		}
+		if (!ident.date_begin) {
+			res = error(_("corrupted author without date information"));
+			goto out;
+		}
+
+		strbuf_addf(&date, "@%.*s %.*s",
+			    (int)(ident.date_end - ident.date_begin),
+			    ident.date_begin,
+			    (int)(ident.tz_end - ident.tz_begin),
+			    ident.tz_begin);
+		res = setenv("GIT_COMMITTER_DATE",
+			     opts->ignore_date ? "" : date.buf, 1);
+		strbuf_release(&date);
+
+		if (res)
+			goto out;
 	}
 
 	if (write_index_as_tree(&tree, r->index, r->index_file, 0, NULL)) {
@@ -1401,6 +1471,16 @@ static int try_to_commit(struct repository *r,
 
 	reset_ident_date();
 
+	if (opts->ignore_date) {
+		author = ignore_author_date(author);
+		if (!author) {
+			res = -1;
+			goto out;
+		}
+		free(author_to_free);
+		author_to_free = (char *)author;
+	}
+
 	if (commit_tree_extended(msg->buf, msg->len, &tree, parents,
 				 oid, author, opts->gpg_sign, extra)) {
 		res = error(_("failed to write commit object"));
@@ -1421,7 +1501,7 @@ out:
 	free_commit_extra_headers(extra);
 	strbuf_release(&err);
 	strbuf_release(&commit_msg);
-	free(amend_author);
+	free(author_to_free);
 
 	return res;
 }
@@ -2528,6 +2608,16 @@ static int read_populate_opts(struct replay_opts *opts)
 			opts->signoff = 1;
 		}
 
+		if (file_exists(rebase_path_cdate_is_adate())) {
+			opts->allow_ff = 0;
+			opts->committer_date_is_author_date = 1;
+		}
+
+		if (file_exists(rebase_path_ignore_date())) {
+			opts->allow_ff = 0;
+			opts->ignore_date = 1;
+		}
+
 		if (file_exists(rebase_path_reschedule_failed_exec()))
 			opts->reschedule_failed_exec = 1;
 
@@ -2623,6 +2713,10 @@ int write_basic_state(struct replay_opts *opts, const char *head_name,
 		write_file(rebase_path_drop_redundant_commits(), "%s", "");
 	if (opts->keep_redundant_commits)
 		write_file(rebase_path_keep_redundant_commits(), "%s", "");
+	if (opts->committer_date_is_author_date)
+		write_file(rebase_path_cdate_is_adate(), "%s", "");
+	if (opts->ignore_date)
+		write_file(rebase_path_ignore_date(), "%s", "");
 	if (opts->reschedule_failed_exec)
 		write_file(rebase_path_reschedule_failed_exec(), "%s", "");
 
@@ -2754,15 +2848,15 @@ static int rollback_is_safe(void)
 static int reset_merge(const struct object_id *oid)
 {
 	int ret;
-	struct argv_array argv = ARGV_ARRAY_INIT;
+	struct strvec argv = STRVEC_INIT;
 
-	argv_array_pushl(&argv, "reset", "--merge", NULL);
+	strvec_pushl(&argv, "reset", "--merge", NULL);
 
 	if (!is_null_oid(oid))
-		argv_array_push(&argv, oid_to_hex(oid));
+		strvec_push(&argv, oid_to_hex(oid));
 
-	ret = run_command_v_opt(argv.argv, RUN_GIT_CMD);
-	argv_array_clear(&argv);
+	ret = run_command_v_opt(argv.v, RUN_GIT_CMD);
+	strvec_clear(&argv);
 
 	return ret;
 }
@@ -3125,17 +3219,17 @@ static int error_failed_squash(struct repository *r,
 
 static int do_exec(struct repository *r, const char *command_line)
 {
-	struct argv_array child_env = ARGV_ARRAY_INIT;
+	struct strvec child_env = STRVEC_INIT;
 	const char *child_argv[] = { NULL, NULL };
 	int dirty, status;
 
 	fprintf(stderr, _("Executing: %s\n"), command_line);
 	child_argv[0] = command_line;
-	argv_array_pushf(&child_env, "GIT_DIR=%s", absolute_path(get_git_dir()));
-	argv_array_pushf(&child_env, "GIT_WORK_TREE=%s",
-			 absolute_path(get_git_work_tree()));
+	strvec_pushf(&child_env, "GIT_DIR=%s", absolute_path(get_git_dir()));
+	strvec_pushf(&child_env, "GIT_WORK_TREE=%s",
+		     absolute_path(get_git_work_tree()));
 	status = run_command_v_opt_cd_env(child_argv, RUN_USING_SHELL, NULL,
-					  child_env.argv);
+					  child_env.v);
 
 	/* force re-reading of the cache */
 	if (discard_index(r->index) < 0 || repo_read_index(r) < 0)
@@ -3165,7 +3259,7 @@ static int do_exec(struct repository *r, const char *command_line)
 		status = 1;
 	}
 
-	argv_array_clear(&child_env);
+	strvec_clear(&child_env);
 
 	return status;
 }
@@ -3543,30 +3637,38 @@ static int do_merge(struct repository *r,
 			goto leave_merge;
 		}
 
+		if (opts->committer_date_is_author_date)
+			strvec_pushf(&cmd.env_array, "GIT_COMMITTER_DATE=%s",
+				     opts->ignore_date ?
+				     "" :
+				     author_date_from_env_array(&cmd.env_array));
+		if (opts->ignore_date)
+			strvec_push(&cmd.env_array, "GIT_AUTHOR_DATE=");
+
 		cmd.git_cmd = 1;
-		argv_array_push(&cmd.args, "merge");
-		argv_array_push(&cmd.args, "-s");
+		strvec_push(&cmd.args, "merge");
+		strvec_push(&cmd.args, "-s");
 		if (!strategy)
-			argv_array_push(&cmd.args, "octopus");
+			strvec_push(&cmd.args, "octopus");
 		else {
-			argv_array_push(&cmd.args, strategy);
+			strvec_push(&cmd.args, strategy);
 			for (k = 0; k < opts->xopts_nr; k++)
-				argv_array_pushf(&cmd.args,
-						 "-X%s", opts->xopts[k]);
+				strvec_pushf(&cmd.args,
+					     "-X%s", opts->xopts[k]);
 		}
-		argv_array_push(&cmd.args, "--no-edit");
-		argv_array_push(&cmd.args, "--no-ff");
-		argv_array_push(&cmd.args, "--no-log");
-		argv_array_push(&cmd.args, "--no-stat");
-		argv_array_push(&cmd.args, "-F");
-		argv_array_push(&cmd.args, git_path_merge_msg(r));
+		strvec_push(&cmd.args, "--no-edit");
+		strvec_push(&cmd.args, "--no-ff");
+		strvec_push(&cmd.args, "--no-log");
+		strvec_push(&cmd.args, "--no-stat");
+		strvec_push(&cmd.args, "-F");
+		strvec_push(&cmd.args, git_path_merge_msg(r));
 		if (opts->gpg_sign)
-			argv_array_push(&cmd.args, opts->gpg_sign);
+			strvec_push(&cmd.args, opts->gpg_sign);
 
 		/* Add the tips to be merged */
 		for (j = to_merge; j; j = j->next)
-			argv_array_push(&cmd.args,
-					oid_to_hex(&j->item->object.oid));
+			strvec_push(&cmd.args,
+				    oid_to_hex(&j->item->object.oid));
 
 		strbuf_release(&ref_name);
 		unlink(git_path_cherry_pick_head(r));
@@ -3694,8 +3796,8 @@ void create_autostash(struct repository *r, const char *path,
 		struct child_process stash = CHILD_PROCESS_INIT;
 		struct object_id oid;
 
-		argv_array_pushl(&stash.args,
-				 "stash", "create", "autostash", NULL);
+		strvec_pushl(&stash.args,
+			     "stash", "create", "autostash", NULL);
 		stash.git_cmd = 1;
 		stash.no_stdin = 1;
 		strbuf_reset(&buf);
@@ -3734,9 +3836,9 @@ static int apply_save_autostash_oid(const char *stash_oid, int attempt_apply)
 		child.git_cmd = 1;
 		child.no_stdout = 1;
 		child.no_stderr = 1;
-		argv_array_push(&child.args, "stash");
-		argv_array_push(&child.args, "apply");
-		argv_array_push(&child.args, stash_oid);
+		strvec_push(&child.args, "stash");
+		strvec_push(&child.args, "apply");
+		strvec_push(&child.args, stash_oid);
 		ret = run_command(&child);
 	}
 
@@ -3746,12 +3848,12 @@ static int apply_save_autostash_oid(const char *stash_oid, int attempt_apply)
 		struct child_process store = CHILD_PROCESS_INIT;
 
 		store.git_cmd = 1;
-		argv_array_push(&store.args, "stash");
-		argv_array_push(&store.args, "store");
-		argv_array_push(&store.args, "-m");
-		argv_array_push(&store.args, "autostash");
-		argv_array_push(&store.args, "-q");
-		argv_array_push(&store.args, stash_oid);
+		strvec_push(&store.args, "stash");
+		strvec_push(&store.args, "store");
+		strvec_push(&store.args, "-m");
+		strvec_push(&store.args, "autostash");
+		strvec_push(&store.args, "-q");
+		strvec_push(&store.args, stash_oid);
 		if (run_command(&store))
 			ret = error(_("cannot store %s"), stash_oid);
 		else
@@ -3831,9 +3933,9 @@ static int run_git_checkout(struct repository *r, struct replay_opts *opts,
 
 	cmd.git_cmd = 1;
 
-	argv_array_push(&cmd.args, "checkout");
-	argv_array_push(&cmd.args, commit);
-	argv_array_pushf(&cmd.env_array, GIT_REFLOG_ACTION "=%s", action);
+	strvec_push(&cmd.args, "checkout");
+	strvec_push(&cmd.args, commit);
+	strvec_pushf(&cmd.env_array, GIT_REFLOG_ACTION "=%s", action);
 
 	if (opts->verbose)
 		ret = run_command(&cmd);
@@ -3906,7 +4008,9 @@ static int pick_commits(struct repository *r,
 	prev_reflog_action = xstrdup(getenv(GIT_REFLOG_ACTION));
 	if (opts->allow_ff)
 		assert(!(opts->signoff || opts->no_commit ||
-				opts->record_origin || opts->edit));
+				opts->record_origin || opts->edit ||
+				opts->committer_date_is_author_date ||
+				opts->ignore_date));
 	if (read_and_refresh_cache(r, opts))
 		return -1;
 
@@ -4157,9 +4261,9 @@ cleanup_head_ref:
 
 			child.in = open(rebase_path_rewritten_list(), O_RDONLY);
 			child.git_cmd = 1;
-			argv_array_push(&child.args, "notes");
-			argv_array_push(&child.args, "copy");
-			argv_array_push(&child.args, "--for-rewrite=rebase");
+			strvec_push(&child.args, "notes");
+			strvec_push(&child.args, "copy");
+			strvec_push(&child.args, "--for-rewrite=rebase");
 			/* we don't care if this copying failed */
 			run_command(&child);
 
@@ -4170,8 +4274,8 @@ cleanup_head_ref:
 					O_RDONLY);
 				hook.stdout_to_stderr = 1;
 				hook.trace2_hook_name = "post-rewrite";
-				argv_array_push(&hook.args, post_rewrite_hook);
-				argv_array_push(&hook.args, "rebase");
+				strvec_push(&hook.args, post_rewrite_hook);
+				strvec_push(&hook.args, "rebase");
 				/* we don't care if this hook failed */
 				run_command(&hook);
 			}

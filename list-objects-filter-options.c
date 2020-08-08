@@ -2,7 +2,7 @@
 #include "commit.h"
 #include "config.h"
 #include "revision.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "list-objects.h"
 #include "list-objects-filter.h"
 #include "list-objects-filter-options.h"
@@ -14,6 +14,29 @@ static int parse_combine_filter(
 	struct list_objects_filter_options *filter_options,
 	const char *arg,
 	struct strbuf *errbuf);
+
+const char *list_object_filter_config_name(enum list_objects_filter_choice c)
+{
+	switch (c) {
+	case LOFC_DISABLED:
+		/* we have no name for "no filter at all" */
+		break;
+	case LOFC_BLOB_NONE:
+		return "blob:none";
+	case LOFC_BLOB_LIMIT:
+		return "blob:limit";
+	case LOFC_TREE_DEPTH:
+		return "tree";
+	case LOFC_SPARSE_OID:
+		return "sparse:oid";
+	case LOFC_COMBINE:
+		return "combine";
+	case LOFC__COUNT:
+		/* not a real filter type; just the count of all filters */
+		break;
+	}
+	BUG("list_object_filter_choice_name: invalid argument '%d'", c);
+}
 
 /*
  * Parse value of the argument to the "filter" keyword.

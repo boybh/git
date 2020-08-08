@@ -1712,8 +1712,8 @@ _git_diff ()
 }
 
 __git_mergetools_common="diffuse diffmerge ecmerge emerge kdiff3 meld opendiff
-			tkdiff vimdiff gvimdiff xxdiff araxis p4merge bc
-			codecompare smerge
+			tkdiff vimdiff nvimdiff gvimdiff xxdiff araxis p4merge
+			bc codecompare smerge
 "
 
 _git_difftool ()
@@ -3059,7 +3059,7 @@ _git_submodule ()
 		__gitcomp "--default --branch"
 		;;
 	summary,--*)
-		__gitcomp "--cached --files --summary-limit"
+		__gitcomp "--cached --files --for-status --summary-limit"
 		;;
 	foreach,--*|sync,--*)
 		__gitcomp "--recursive"
@@ -3390,6 +3390,8 @@ __git_main ()
 			--namespace=
 			--no-replace-objects
 			--help
+			--restrict-to-sparse-paths
+			--no-restrict-to-sparse-paths
 			"
 			;;
 		*)

@@ -23,7 +23,7 @@
 #include "bisect.h"
 #include "packfile.h"
 #include "worktree.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "commit-reach.h"
 #include "commit-graph.h"
 #include "prio-queue.h"
@@ -439,7 +439,7 @@ static struct commit *handle_commit(struct rev_info *revs,
 	if (object->type == OBJ_COMMIT) {
 		struct commit *commit = (struct commit *)object;
 
-		if (parse_commit(commit) < 0)
+		if (repo_parse_commit(revs->repo, commit) < 0)
 			die("unable to parse commit %s", name);
 		if (flags & UNINTERESTING) {
 			mark_parents_uninteresting(commit);
@@ -669,7 +669,6 @@ static void prepare_to_use_bloom_filter(struct rev_info *revs)
 	struct pathspec_item *pi;
 	char *path_alloc = NULL;
 	const char *path, *p;
-	int last_index;
 	size_t len;
 	int path_component_nr = 1;
 
@@ -692,12 +691,10 @@ static void prepare_to_use_bloom_filter(struct rev_info *revs)
 		return;
 
 	pi = &revs->pruning.pathspec.items[0];
-	last_index = pi->len - 1;
 
 	/* remove single trailing slash from path, if needed */
-	if (pi->match[last_index] == '/') {
-		path_alloc = xstrdup(pi->match);
-		path_alloc[last_index] = '\0';
+	if (pi->len > 0 && pi->match[pi->len - 1] == '/') {
+		path_alloc = xmemdupz(pi->match, pi->len - 1);
 		path = path_alloc;
 	} else
 		path = pi->match;
@@ -705,6 +702,7 @@ static void prepare_to_use_bloom_filter(struct rev_info *revs)
 	len = strlen(path);
 	if (!len) {
 		revs->bloom_filter_settings = NULL;
+		free(path_alloc);
 		return;
 	}
 
@@ -1014,7 +1012,7 @@ static void try_to_simplify_commit(struct rev_info *revs, struct commit *commit)
 					ts->treesame[0] = 1;
 			}
 		}
-		if (parse_commit(p) < 0)
+		if (repo_parse_commit(revs->repo, p) < 0)
 			die("cannot simplify commit %s (because of %s)",
 			    oid_to_hex(&commit->object.oid),
 			    oid_to_hex(&p->object.oid));
@@ -1059,7 +1057,7 @@ static void try_to_simplify_commit(struct rev_info *revs, struct commit *commit)
 				 * IOW, we pretend this parent is a
 				 * "root" commit.
 				 */
-				if (parse_commit(p) < 0)
+				if (repo_parse_commit(revs->repo, p) < 0)
 					die("cannot simplify commit %s (invalid %s)",
 					    oid_to_hex(&commit->object.oid),
 					    oid_to_hex(&p->object.oid));
@@ -1127,7 +1125,7 @@ static int process_parents(struct rev_info *revs, struct commit *commit,
 			parent = parent->next;
 			if (p)
 				p->object.flags |= UNINTERESTING;
-			if (parse_commit_gently(p, 1) < 0)
+			if (repo_parse_commit_gently(revs->repo, p, 1) < 0)
 				continue;
 			if (p->parents)
 				mark_parents_uninteresting(p);
@@ -1158,7 +1156,7 @@ static int process_parents(struct rev_info *revs, struct commit *commit,
 		struct commit *p = parent->item;
 		int gently = revs->ignore_missing_links ||
 			     revs->exclude_promisor_objects;
-		if (parse_commit_gently(p, gently) < 0) {
+		if (repo_parse_commit_gently(revs->repo, p, gently) < 0) {
 			if (revs->exclude_promisor_objects &&
 			    is_promisor_object(&p->object.oid)) {
 				if (revs->first_parent_only)
@@ -1817,7 +1815,7 @@ void repo_init_revisions(struct repository *r,
 
 	revs->repo = r;
 	revs->abbrev = DEFAULT_ABBREV;
-	revs->ignore_merges = 1;
+	revs->ignore_merges = -1;
 	revs->simplify_history = 1;
 	revs->pruning.repo = r;
 	revs->pruning.flags.recursive = 1;
@@ -2095,14 +2093,14 @@ int handle_revision_arg(const char *arg_, struct rev_info *revs, int flags, unsi
 }
 
 static void read_pathspec_from_stdin(struct strbuf *sb,
-				     struct argv_array *prune)
+				     struct strvec *prune)
 {
 	while (strbuf_getline(sb, stdin) != EOF)
-		argv_array_push(prune, sb->buf);
+		strvec_push(prune, sb->buf);
 }
 
 static void read_revisions_from_stdin(struct rev_info *revs,
-				      struct argv_array *prune)
+				      struct strvec *prune)
 {
 	struct strbuf sb;
 	int seen_dashdash = 0;
@@ -2337,7 +2335,7 @@ static int handle_revision_opt(struct rev_info *revs, int argc, const char **arg
 	} else if (!strcmp(arg, "--unpacked")) {
 		revs->unpacked = 1;
 	} else if (starts_with(arg, "--unpacked=")) {
-		die("--unpacked=<packfile> no longer supported.");
+		die(_("--unpacked=<packfile> no longer supported"));
 	} else if (!strcmp(arg, "-r")) {
 		revs->diff = 1;
 		revs->diffopt.flags.recursive = 1;
@@ -2345,8 +2343,10 @@ static int handle_revision_opt(struct rev_info *revs, int argc, const char **arg
 		revs->diff = 1;
 		revs->diffopt.flags.recursive = 1;
 		revs->diffopt.flags.tree_in_recursive = 1;
-	} else if (!strcmp(arg, "-m")) {
+	} else if (!strcmp(arg, "-m") || !strcmp(arg, "--diff-merges")) {
 		revs->ignore_merges = 0;
+	} else if (!strcmp(arg, "--no-diff-merges")) {
+		revs->ignore_merges = 1;
 	} else if (!strcmp(arg, "-c")) {
 		revs->diff = 1;
 		revs->dense_combined_merges = 0;
@@ -2697,7 +2697,7 @@ static void NORETURN diagnose_missing_default(const char *def)
 int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct setup_revision_opt *opt)
 {
 	int i, flags, left, seen_dashdash, got_rev_arg = 0, revarg_opt;
-	struct argv_array prune_data = ARGV_ARRAY_INIT;
+	struct strvec prune_data = STRVEC_INIT;
 	const char *submodule = NULL;
 	int seen_end_of_options = 0;
 
@@ -2716,7 +2716,7 @@ int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct s
 			argv[i] = NULL;
 			argc = i;
 			if (argv[i + 1])
-				argv_array_pushv(&prune_data, argv + i + 1);
+				strvec_pushv(&prune_data, argv + i + 1);
 			seen_dashdash = 1;
 			break;
 		}
@@ -2782,14 +2782,14 @@ int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct s
 			for (j = i; j < argc; j++)
 				verify_filename(revs->prefix, argv[j], j == i);
 
-			argv_array_pushv(&prune_data, argv + i);
+			strvec_pushv(&prune_data, argv + i);
 			break;
 		}
 		else
 			got_rev_arg = 1;
 	}
 
-	if (prune_data.argc) {
+	if (prune_data.nr) {
 		/*
 		 * If we need to introduce the magic "a lone ':' means no
 		 * pathspec whatsoever", here is the place to do so.
@@ -2805,9 +2805,9 @@ int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct s
 		 * }
 		 */
 		parse_pathspec(&revs->prune_data, 0, 0,
-			       revs->prefix, prune_data.argv);
+			       revs->prefix, prune_data.v);
 	}
-	argv_array_clear(&prune_data);
+	strvec_clear(&prune_data);
 
 	if (revs->def == NULL)
 		revs->def = opt ? opt->def : NULL;
@@ -2856,8 +2856,10 @@ int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct s
 			copy_pathspec(&revs->diffopt.pathspec,
 				      &revs->prune_data);
 	}
-	if (revs->combine_merges)
+	if (revs->combine_merges && revs->ignore_merges < 0)
 		revs->ignore_merges = 0;
+	if (revs->ignore_merges < 0)
+		revs->ignore_merges = 1;
 	if (revs->combined_all_paths && !revs->combine_merges)
 		die("--combined-all-paths makes no sense without -c or --cc");
 
@@ -2890,9 +2892,6 @@ int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct s
 		die("cannot combine --no-walk with --graph");
 	if (!revs->reflog_info && revs->grep_filter.use_reflog_filter)
 		die("cannot use --grep-reflog without --walk-reflogs");
-
-	if (revs->first_parent_only && revs->bisect)
-		die(_("--first-parent is incompatible with --bisect"));
 
 	if (revs->line_level_traverse &&
 	    (revs->diffopt.output_format & ~(DIFF_FORMAT_PATCH | DIFF_FORMAT_NO_OUTPUT)))
@@ -3318,7 +3317,7 @@ static void explore_walk_step(struct rev_info *revs)
 	if (!c)
 		return;
 
-	if (parse_commit_gently(c, 1) < 0)
+	if (repo_parse_commit_gently(revs->repo, c, 1) < 0)
 		return;
 
 	if (revs->sort_order == REV_SORT_BY_AUTHOR_DATE)
@@ -3356,7 +3355,7 @@ static void indegree_walk_step(struct rev_info *revs)
 	if (!c)
 		return;
 
-	if (parse_commit_gently(c, 1) < 0)
+	if (repo_parse_commit_gently(revs->repo, c, 1) < 0)
 		return;
 
 	explore_to_depth(revs, commit_graph_generation(c));
@@ -3438,7 +3437,7 @@ static void init_topo_walk(struct rev_info *revs)
 		struct commit *c = list->item;
 		uint32_t generation;
 
-		if (parse_commit_gently(c, 1))
+		if (repo_parse_commit_gently(revs->repo, c, 1))
 			continue;
 
 		test_flag_and_insert(&info->explore_queue, c, TOPO_WALK_EXPLORED);
@@ -3502,7 +3501,7 @@ static void expand_topo_walk(struct rev_info *revs, struct commit *commit)
 		if (parent->object.flags & UNINTERESTING)
 			continue;
 
-		if (parse_commit_gently(parent, 1) < 0)
+		if (repo_parse_commit_gently(revs->repo, parent, 1) < 0)
 			continue;
 
 		generation = commit_graph_generation(parent);

@@ -5,6 +5,7 @@
 #include "run-command.h"
 #include "alias.h"
 #include "shallow.h"
+#include "sparse-checkout.h"
 
 #define RUN_SETUP		(1<<0)
 #define RUN_SETUP_GENTLY	(1<<1)
@@ -311,6 +312,10 @@ static int handle_options(const char ***argv, int *argc, int *envchanged)
 			} else {
 				exit(list_cmds(cmd));
 			}
+		} else if (!strcmp(cmd, "--restrict-to-sparse-paths")) {
+			opt_restrict_to_sparse_paths = 1;
+		} else if (!strcmp(cmd, "--no-restrict-to-sparse-paths")) {
+			opt_restrict_to_sparse_paths = 0;
 		} else {
 			fprintf(stderr, _("unknown option: %s\n"), cmd);
 			usage(git_usage_string);
@@ -349,10 +354,10 @@ static int handle_alias(int *argcp, const char ***argv)
 			child.clean_on_exit = 1;
 			child.wait_after_clean = 1;
 			child.trace2_child_class = "shell_alias";
-			argv_array_push(&child.args, alias_string + 1);
-			argv_array_pushv(&child.args, (*argv) + 1);
+			strvec_push(&child.args, alias_string + 1);
+			strvec_pushv(&child.args, (*argv) + 1);
 
-			trace2_cmd_alias(alias_command, child.args.argv);
+			trace2_cmd_alias(alias_command, child.args.v);
 			trace2_cmd_list_config();
 			trace2_cmd_list_env_vars();
 			trace2_cmd_name("_run_shell_alias_");
@@ -519,6 +524,7 @@ static struct cmd_struct commands[] = {
 	{ "grep", cmd_grep, RUN_SETUP_GENTLY },
 	{ "hash-object", cmd_hash_object },
 	{ "help", cmd_help },
+	{ "hook", cmd_hook, RUN_SETUP },
 	{ "index-pack", cmd_index_pack, RUN_SETUP_GENTLY | NO_PARSEOPT },
 	{ "init", cmd_init_db },
 	{ "init-db", cmd_init_db },
@@ -529,6 +535,7 @@ static struct cmd_struct commands[] = {
 	{ "ls-tree", cmd_ls_tree, RUN_SETUP },
 	{ "mailinfo", cmd_mailinfo, RUN_SETUP_GENTLY | NO_PARSEOPT },
 	{ "mailsplit", cmd_mailsplit, NO_PARSEOPT },
+	{ "maintenance", cmd_maintenance, RUN_SETUP_GENTLY | NO_PARSEOPT },
 	{ "merge", cmd_merge, RUN_SETUP | NEED_WORK_TREE },
 	{ "merge-base", cmd_merge_base, RUN_SETUP },
 	{ "merge-file", cmd_merge_file, RUN_SETUP_GENTLY },
@@ -646,7 +653,7 @@ static void strip_extension(const char **argv)
 
 static void handle_builtin(int argc, const char **argv)
 {
-	struct argv_array args = ARGV_ARRAY_INIT;
+	struct strvec args = STRVEC_INIT;
 	const char *cmd;
 	struct cmd_struct *builtin;
 
@@ -661,19 +668,19 @@ static void handle_builtin(int argc, const char **argv)
 		argv[0] = cmd = "help";
 
 		for (i = 0; i < argc; i++) {
-			argv_array_push(&args, argv[i]);
+			strvec_push(&args, argv[i]);
 			if (!i)
-				argv_array_push(&args, "--exclude-guides");
+				strvec_push(&args, "--exclude-guides");
 		}
 
 		argc++;
-		argv = args.argv;
+		argv = args.v;
 	}
 
 	builtin = get_builtin(cmd);
 	if (builtin)
 		exit(run_builtin(builtin, argc, argv));
-	argv_array_clear(&args);
+	strvec_clear(&args);
 }
 
 static void execv_dashed_external(const char **argv)
@@ -688,8 +695,8 @@ static void execv_dashed_external(const char **argv)
 		use_pager = check_pager_config(argv[0]);
 	commit_pager_choice();
 
-	argv_array_pushf(&cmd.args, "git-%s", argv[0]);
-	argv_array_pushv(&cmd.args, argv + 1);
+	strvec_pushf(&cmd.args, "git-%s", argv[0]);
+	strvec_pushv(&cmd.args, argv + 1);
 	cmd.clean_on_exit = 1;
 	cmd.wait_after_clean = 1;
 	cmd.silent_exec_failure = 1;
@@ -701,7 +708,7 @@ static void execv_dashed_external(const char **argv)
 	 * The code in run_command() logs trace2 child_start/child_exit
 	 * events, so we do not need to report exec/exec_result events here.
 	 */
-	trace_argv_printf(cmd.args.argv, "trace: exec:");
+	trace_argv_printf(cmd.args.v, "trace: exec:");
 
 	/*
 	 * If we fail because the command is not found, it is
@@ -741,7 +748,7 @@ static int run_argv(int *argcp, const char ***argv)
 		if (!done_alias)
 			handle_builtin(*argcp, *argv);
 		else if (get_builtin(**argv)) {
-			struct argv_array args = ARGV_ARRAY_INIT;
+			struct strvec args = STRVEC_INIT;
 			int i;
 
 			/*
@@ -758,17 +765,17 @@ static int run_argv(int *argcp, const char ***argv)
 
 			commit_pager_choice();
 
-			argv_array_push(&args, "git");
+			strvec_push(&args, "git");
 			for (i = 0; i < *argcp; i++)
-				argv_array_push(&args, (*argv)[i]);
+				strvec_push(&args, (*argv)[i]);
 
-			trace_argv_printf(args.argv, "trace: exec:");
+			trace_argv_printf(args.v, "trace: exec:");
 
 			/*
 			 * if we fail because the command is not found, it is
 			 * OK to return. Otherwise, we just pass along the status code.
 			 */
-			i = run_command_v_opt_tr2(args.argv, RUN_SILENT_EXEC_FAILURE |
+			i = run_command_v_opt_tr2(args.v, RUN_SILENT_EXEC_FAILURE |
 						  RUN_CLEAN_ON_EXIT | RUN_WAIT_AFTER_CLEAN, "git_alias");
 			if (i >= 0 || errno != ENOENT)
 				exit(i);

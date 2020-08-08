@@ -4,7 +4,7 @@
 #include "commit.h"
 #include "color.h"
 #include "string-list.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "oid-array.h"
 
 /*----- some often used options -----*/
@@ -205,6 +205,22 @@ int parse_opt_string_list(const struct option *opt, const char *arg, int unset)
 	return 0;
 }
 
+int parse_opt_strvec(const struct option *opt, const char *arg, int unset)
+{
+	struct strvec *v = opt->value;
+
+	if (unset) {
+		strvec_clear(v);
+		return 0;
+	}
+
+	if (!arg)
+		return -1;
+
+	strvec_push(v, arg);
+	return 0;
+}
+
 int parse_opt_noop_cb(const struct option *opt, const char *arg, int unset)
 {
 	return 0;
@@ -275,19 +291,19 @@ int parse_opt_passthru(const struct option *opt, const char *arg, int unset)
 
 /**
  * For an option opt, recreate the command-line option, appending it to
- * opt->value which must be a argv_array. This is useful when we need to pass
+ * opt->value which must be a strvec. This is useful when we need to pass
  * the command-line option, which can be specified multiple times, to another
  * command.
  */
 int parse_opt_passthru_argv(const struct option *opt, const char *arg, int unset)
 {
 	static struct strbuf sb = STRBUF_INIT;
-	struct argv_array *opt_value = opt->value;
+	struct strvec *opt_value = opt->value;
 
 	if (recreate_opt(&sb, opt, arg, unset) < 0)
 		return -1;
 
-	argv_array_push(opt_value, sb.buf);
+	strvec_push(opt_value, sb.buf);
 
 	return 0;
 }

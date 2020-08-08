@@ -10,6 +10,7 @@
 #include "progress.h"
 #include "trace2.h"
 #include "run-command.h"
+#include "repository.h"
 
 #define MIDX_SIGNATURE 0x4d494458 /* "MIDX" */
 #define MIDX_VERSION 1
@@ -36,7 +37,7 @@
 
 #define PACK_EXPIRED UINT_MAX
 
-static char *get_midx_filename(const char *object_dir)
+char *get_midx_filename(const char *object_dir)
 {
 	return xstrfmt("%s/pack/multi-pack-index", object_dir);
 }
@@ -384,15 +385,9 @@ int prepare_multi_pack_index_one(struct repository *r, const char *object_dir, i
 {
 	struct multi_pack_index *m;
 	struct multi_pack_index *m_search;
-	int config_value;
-	static int env_value = -1;
 
-	if (env_value < 0)
-		env_value = git_env_bool(GIT_TEST_MULTI_PACK_INDEX, 0);
-
-	if (!env_value &&
-	    (repo_config_get_bool(r, "core.multipackindex", &config_value) ||
-	    !config_value))
+	prepare_repo_settings(r);
+	if (!r->settings.core_multi_pack_index)
 		return 0;
 
 	for (m_search = r->objects->multi_pack_index; m_search; m_search = m_search->next)
@@ -837,7 +832,7 @@ static int write_midx_internal(const char *object_dir, struct multi_pack_index *
 
 	packs.pack_paths_checked = 0;
 	if (flags & MIDX_PROGRESS)
-		packs.progress = start_progress(_("Adding packfiles to multi-pack-index"), 0);
+		packs.progress = start_delayed_progress(_("Adding packfiles to multi-pack-index"), 0);
 	else
 		packs.progress = NULL;
 
@@ -974,7 +969,7 @@ static int write_midx_internal(const char *object_dir, struct multi_pack_index *
 	}
 
 	if (flags & MIDX_PROGRESS)
-		progress = start_progress(_("Writing chunks to multi-pack-index"),
+		progress = start_delayed_progress(_("Writing chunks to multi-pack-index"),
 					  num_chunks);
 	for (i = 0; i < num_chunks; i++) {
 		if (written != chunk_offsets[i])
@@ -1109,7 +1104,7 @@ int verify_midx_file(struct repository *r, const char *object_dir, unsigned flag
 		return 0;
 
 	if (flags & MIDX_PROGRESS)
-		progress = start_progress(_("Looking for referenced packfiles"),
+		progress = start_delayed_progress(_("Looking for referenced packfiles"),
 					  m->num_packs);
 	for (i = 0; i < m->num_packs; i++) {
 		if (prepare_midx_pack(r, m, i))
@@ -1230,7 +1225,7 @@ int expire_midx_packs(struct repository *r, const char *object_dir, unsigned fla
 	count = xcalloc(m->num_packs, sizeof(uint32_t));
 
 	if (flags & MIDX_PROGRESS)
-		progress = start_progress(_("Counting referenced objects"),
+		progress = start_delayed_progress(_("Counting referenced objects"),
 					  m->num_objects);
 	for (i = 0; i < m->num_objects; i++) {
 		int pack_int_id = nth_midxed_pack_int_id(m, i);
@@ -1240,7 +1235,7 @@ int expire_midx_packs(struct repository *r, const char *object_dir, unsigned fla
 	stop_progress(&progress);
 
 	if (flags & MIDX_PROGRESS)
-		progress = start_progress(_("Finding and deleting unreferenced packfiles"),
+		progress = start_delayed_progress(_("Finding and deleting unreferenced packfiles"),
 					  m->num_packs);
 	for (i = 0; i < m->num_packs; i++) {
 		char *pack_name;
@@ -1383,6 +1378,7 @@ int midx_repack(struct repository *r, const char *object_dir, size_t batch_size,
 	uint32_t i;
 	unsigned char *include_pack;
 	struct child_process cmd = CHILD_PROCESS_INIT;
+	FILE *cmd_in;
 	struct strbuf base_name = STRBUF_INIT;
 	struct multi_pack_index *m = load_multi_pack_index(object_dir, 1);
 
@@ -1408,21 +1404,21 @@ int midx_repack(struct repository *r, const char *object_dir, size_t batch_size,
 	repo_config_get_bool(r, "repack.usedeltabaseoffset", &delta_base_offset);
 	repo_config_get_bool(r, "repack.usedeltaislands", &use_delta_islands);
 
-	argv_array_push(&cmd.args, "pack-objects");
+	strvec_push(&cmd.args, "pack-objects");
 
 	strbuf_addstr(&base_name, object_dir);
 	strbuf_addstr(&base_name, "/pack/pack");
-	argv_array_push(&cmd.args, base_name.buf);
+	strvec_push(&cmd.args, base_name.buf);
 
 	if (delta_base_offset)
-		argv_array_push(&cmd.args, "--delta-base-offset");
+		strvec_push(&cmd.args, "--delta-base-offset");
 	if (use_delta_islands)
-		argv_array_push(&cmd.args, "--delta-islands");
+		strvec_push(&cmd.args, "--delta-islands");
 
 	if (flags & MIDX_PROGRESS)
-		argv_array_push(&cmd.args, "--progress");
+		strvec_push(&cmd.args, "--progress");
 	else
-		argv_array_push(&cmd.args, "-q");
+		strvec_push(&cmd.args, "-q");
 
 	strbuf_release(&base_name);
 
@@ -1435,6 +1431,8 @@ int midx_repack(struct repository *r, const char *object_dir, size_t batch_size,
 		goto cleanup;
 	}
 
+	cmd_in = xfdopen(cmd.in, "w");
+
 	for (i = 0; i < m->num_objects; i++) {
 		struct object_id oid;
 		uint32_t pack_int_id = nth_midxed_pack_int_id(m, i);
@@ -1443,10 +1441,15 @@ int midx_repack(struct repository *r, const char *object_dir, size_t batch_size,
 			continue;
 
 		nth_midxed_object_oid(&oid, m, i);
-		xwrite(cmd.in, oid_to_hex(&oid), the_hash_algo->hexsz);
-		xwrite(cmd.in, "\n", 1);
+		fprintf(cmd_in, "%s\n", oid_to_hex(&oid));
 	}
-	close(cmd.in);
+
+	if (fclose(cmd_in)) {
+		error_errno(_("could not close stdin of pack-objects"));
+		result = 1;
+		finish_command(&cmd);
+		goto cleanup;
+	}
 
 	if (finish_command(&cmd)) {
 		error(_("could not finish pack-objects"));

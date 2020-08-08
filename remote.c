@@ -11,7 +11,7 @@
 #include "tag.h"
 #include "string-list.h"
 #include "mergesort.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "commit-reach.h"
 #include "advice.h"
 
@@ -503,28 +503,6 @@ const char *pushremote_for_branch(struct branch *branch, int *explicit)
 		return pushremote_name;
 	}
 	return remote_for_branch(branch, explicit);
-}
-
-const char *remote_ref_for_branch(struct branch *branch, int for_push)
-{
-	if (branch) {
-		if (!for_push) {
-			if (branch->merge_nr) {
-				return branch->merge_name[0];
-			}
-		} else {
-			const char *dst, *remote_name =
-				pushremote_for_branch(branch, NULL);
-			struct remote *remote = remote_get(remote_name);
-
-			if (remote && remote->push.nr &&
-			    (dst = apply_refspecs(&remote->push,
-						  branch->refname))) {
-				return dst;
-			}
-		}
-	}
-	return NULL;
 }
 
 static struct remote *remote_get_1(const char *name,
@@ -1645,6 +1623,64 @@ static const char *tracking_for_push_dest(struct remote *remote,
 	return ret;
 }
 
+/**
+ * Return the local name of the remote tracking branch, as in
+ * %(push:remoteref), that corresponds to the ref we would push to given a
+ * bare `git push` while `branch` is checked out.
+ * See also branch_get_push_1 below.
+ */
+static const char *branch_get_push_remoteref(struct branch *branch)
+{
+	struct remote *remote;
+
+	remote = remote_get(pushremote_for_branch(branch, NULL));
+	if (!remote)
+		return NULL;
+
+	if (remote->push.nr) {
+		return apply_refspecs(&remote->push, branch->refname);
+	}
+
+	if (remote->mirror)
+		return branch->refname;
+
+	switch (push_default) {
+	case PUSH_DEFAULT_NOTHING:
+		return NULL;
+
+	case PUSH_DEFAULT_MATCHING:
+	case PUSH_DEFAULT_CURRENT:
+		return branch->refname;
+
+	case PUSH_DEFAULT_UPSTREAM:
+		if (branch && branch->merge && branch->merge[0] &&
+		    branch->merge[0]->dst)
+			return branch->merge[0]->src;
+		else
+			return NULL;
+
+	case PUSH_DEFAULT_UNSPECIFIED:
+	case PUSH_DEFAULT_SIMPLE:
+		{
+			const char *up, *cur;
+
+			up = branch_get_upstream(branch, NULL);
+			cur = tracking_for_push_dest(remote, branch->refname, NULL);
+			if (up && cur && !strcmp(cur, up))
+				return branch->refname;
+			else
+				return NULL;
+
+		}
+	}
+	BUG("unhandled push situation");
+}
+
+/**
+ * Return the tracking branch, as in %(push), that corresponds to the ref we
+ * would push to given a bare `git push` while `branch` is checked out.
+ * See also branch_get_push_remoteref above.
+ */
 static const char *branch_get_push_1(struct branch *branch, struct strbuf *err)
 {
 	struct remote *remote;
@@ -1722,6 +1758,20 @@ static int ignore_symref_update(const char *refname)
 	if (!resolve_ref_unsafe(refname, 0, NULL, &flag))
 		return 0; /* non-existing refs are OK */
 	return (flag & REF_ISSYMREF);
+}
+
+const char *remote_ref_for_branch(struct branch *branch, int for_push)
+{
+	if (branch) {
+		if (!for_push) {
+			if (branch->merge_nr) {
+				return branch->merge_name[0];
+			}
+		} else {
+			return branch_get_push_remoteref(branch);
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -1885,7 +1935,7 @@ static int stat_branch_pair(const char *branch_name, const char *base,
 	struct object_id oid;
 	struct commit *ours, *theirs;
 	struct rev_info revs;
-	struct argv_array argv = ARGV_ARRAY_INIT;
+	struct strvec argv = STRVEC_INIT;
 
 	/* Cannot stat if what we used to build on no longer exists */
 	if (read_ref(base, &oid))
@@ -1911,15 +1961,15 @@ static int stat_branch_pair(const char *branch_name, const char *base,
 		BUG("stat_branch_pair: invalid abf '%d'", abf);
 
 	/* Run "rev-list --left-right ours...theirs" internally... */
-	argv_array_push(&argv, ""); /* ignored */
-	argv_array_push(&argv, "--left-right");
-	argv_array_pushf(&argv, "%s...%s",
-			 oid_to_hex(&ours->object.oid),
-			 oid_to_hex(&theirs->object.oid));
-	argv_array_push(&argv, "--");
+	strvec_push(&argv, ""); /* ignored */
+	strvec_push(&argv, "--left-right");
+	strvec_pushf(&argv, "%s...%s",
+		     oid_to_hex(&ours->object.oid),
+		     oid_to_hex(&theirs->object.oid));
+	strvec_push(&argv, "--");
 
 	repo_init_revisions(the_repository, &revs, NULL);
-	setup_revisions(argv.argc, argv.argv, &revs, NULL);
+	setup_revisions(argv.nr, argv.v, &revs, NULL);
 	if (prepare_revision_walk(&revs))
 		die(_("revision walk setup failed"));
 
@@ -1938,7 +1988,7 @@ static int stat_branch_pair(const char *branch_name, const char *base,
 	clear_commit_marks(ours, ALL_REV_FLAGS);
 	clear_commit_marks(theirs, ALL_REV_FLAGS);
 
-	argv_array_clear(&argv);
+	strvec_clear(&argv);
 	return 1;
 }
 

@@ -19,7 +19,7 @@
 #include "submodule-config.h"
 #include "submodule.h"
 #include "connected.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "utf8.h"
 #include "packfile.h"
 #include "list-objects-filter-options.h"
@@ -56,6 +56,7 @@ static int prune_tags = -1; /* unspecified */
 #define PRUNE_TAGS_BY_DEFAULT 0 /* do we prune tags by default? */
 
 static int all, append, dry_run, force, keep, multiple, update_head_ok;
+static int write_fetch_head = 1;
 static int verbosity, deepen_relative, set_upstream;
 static int progress = -1;
 static int enable_auto_gc = 1;
@@ -118,6 +119,10 @@ static int git_fetch_config(const char *k, const char *v, void *cb)
 		return 0;
 	}
 
+	if (!strcmp(k, "fetch.writefetchhead")) {
+		write_fetch_head = git_config_bool(k, v);
+		return 0;
+	}
 	return git_default_config(k, v, cb);
 }
 
@@ -162,6 +167,8 @@ static struct option builtin_fetch_options[] = {
 		    PARSE_OPT_OPTARG, option_fetch_parse_recurse_submodules),
 	OPT_BOOL(0, "dry-run", &dry_run,
 		 N_("dry run")),
+	OPT_BOOL(0, "write-fetch-head", &write_fetch_head,
+		 N_("write fetched references to the FETCH_HEAD file")),
 	OPT_BOOL('k', "keep", &keep, N_("keep downloaded pack")),
 	OPT_BOOL('u', "update-head-ok", &update_head_ok,
 		    N_("allow updating of HEAD ref")),
@@ -196,8 +203,10 @@ static struct option builtin_fetch_options[] = {
 	OPT_STRING_LIST(0, "negotiation-tip", &negotiation_tip, N_("revision"),
 			N_("report that we have only objects reachable from this object")),
 	OPT_PARSE_LIST_OBJECTS_FILTER(&filter_options),
+	OPT_BOOL(0, "auto-maintenance", &enable_auto_gc,
+		 N_("run 'maintenance --auto' after fetching")),
 	OPT_BOOL(0, "auto-gc", &enable_auto_gc,
-		 N_("run 'gc --auto' after fetching")),
+		 N_("run 'maintenance --auto' after fetching")),
 	OPT_BOOL(0, "show-forced-updates", &fetch_show_forced_updates,
 		 N_("check for forced-updates on all updated branches")),
 	OPT_BOOL(0, "write-commit-graph", &fetch_write_commit_graph,
@@ -893,7 +902,9 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 	const char *what, *kind;
 	struct ref *rm;
 	char *url;
-	const char *filename = dry_run ? "/dev/null" : git_path_fetch_head(the_repository);
+	const char *filename = (!write_fetch_head
+				? "/dev/null"
+				: git_path_fetch_head(the_repository));
 	int want_status;
 	int summary_width = transport_summary_width(ref_map);
 
@@ -1316,7 +1327,7 @@ static int do_fetch(struct transport *transport,
 	int autotags = (transport->remote->fetch_tags == 1);
 	int retcode = 0;
 	const struct ref *remote_refs;
-	struct argv_array ref_prefixes = ARGV_ARRAY_INIT;
+	struct strvec ref_prefixes = STRVEC_INIT;
 	int must_list_refs = 1;
 
 	if (tags == TAGS_DEFAULT) {
@@ -1327,7 +1338,7 @@ static int do_fetch(struct transport *transport,
 	}
 
 	/* if not appending, truncate FETCH_HEAD */
-	if (!append && !dry_run) {
+	if (!append && write_fetch_head) {
 		retcode = truncate_fetch_head();
 		if (retcode)
 			goto cleanup;
@@ -1354,8 +1365,8 @@ static int do_fetch(struct transport *transport,
 
 	if (tags == TAGS_SET || tags == TAGS_DEFAULT) {
 		must_list_refs = 1;
-		if (ref_prefixes.argc)
-			argv_array_push(&ref_prefixes, "refs/tags/");
+		if (ref_prefixes.nr)
+			strvec_push(&ref_prefixes, "refs/tags/");
 	}
 
 	if (must_list_refs) {
@@ -1365,7 +1376,7 @@ static int do_fetch(struct transport *transport,
 	} else
 		remote_refs = NULL;
 
-	argv_array_clear(&ref_prefixes);
+	strvec_clear(&ref_prefixes);
 
 	ref_map = get_ref_map(transport->remote, remote_refs, rs,
 			      tags, &autotags);
@@ -1503,34 +1514,34 @@ static int add_remote_or_group(const char *name, struct string_list *list)
 	return 1;
 }
 
-static void add_options_to_argv(struct argv_array *argv)
+static void add_options_to_argv(struct strvec *argv)
 {
 	if (dry_run)
-		argv_array_push(argv, "--dry-run");
+		strvec_push(argv, "--dry-run");
 	if (prune != -1)
-		argv_array_push(argv, prune ? "--prune" : "--no-prune");
+		strvec_push(argv, prune ? "--prune" : "--no-prune");
 	if (prune_tags != -1)
-		argv_array_push(argv, prune_tags ? "--prune-tags" : "--no-prune-tags");
+		strvec_push(argv, prune_tags ? "--prune-tags" : "--no-prune-tags");
 	if (update_head_ok)
-		argv_array_push(argv, "--update-head-ok");
+		strvec_push(argv, "--update-head-ok");
 	if (force)
-		argv_array_push(argv, "--force");
+		strvec_push(argv, "--force");
 	if (keep)
-		argv_array_push(argv, "--keep");
+		strvec_push(argv, "--keep");
 	if (recurse_submodules == RECURSE_SUBMODULES_ON)
-		argv_array_push(argv, "--recurse-submodules");
+		strvec_push(argv, "--recurse-submodules");
 	else if (recurse_submodules == RECURSE_SUBMODULES_ON_DEMAND)
-		argv_array_push(argv, "--recurse-submodules=on-demand");
+		strvec_push(argv, "--recurse-submodules=on-demand");
 	if (tags == TAGS_SET)
-		argv_array_push(argv, "--tags");
+		strvec_push(argv, "--tags");
 	else if (tags == TAGS_UNSET)
-		argv_array_push(argv, "--no-tags");
+		strvec_push(argv, "--no-tags");
 	if (verbosity >= 2)
-		argv_array_push(argv, "-v");
+		strvec_push(argv, "-v");
 	if (verbosity >= 1)
-		argv_array_push(argv, "-v");
+		strvec_push(argv, "-v");
 	else if (verbosity < 0)
-		argv_array_push(argv, "-q");
+		strvec_push(argv, "-q");
 
 }
 
@@ -1554,8 +1565,8 @@ static int fetch_next_remote(struct child_process *cp, struct strbuf *out,
 	remote = state->remotes->items[state->next++].string;
 	*task_cb = remote;
 
-	argv_array_pushv(&cp->args, state->argv);
-	argv_array_push(&cp->args, remote);
+	strvec_pushv(&cp->args, state->argv);
+	strvec_push(&cp->args, remote);
 	cp->git_cmd = 1;
 
 	if (verbosity >= 0)
@@ -1592,22 +1603,22 @@ static int fetch_finished(int result, struct strbuf *out,
 static int fetch_multiple(struct string_list *list, int max_children)
 {
 	int i, result = 0;
-	struct argv_array argv = ARGV_ARRAY_INIT;
+	struct strvec argv = STRVEC_INIT;
 
-	if (!append && !dry_run) {
+	if (!append && write_fetch_head) {
 		int errcode = truncate_fetch_head();
 		if (errcode)
 			return errcode;
 	}
 
-	argv_array_pushl(&argv, "fetch", "--append", "--no-auto-gc",
-			"--no-write-commit-graph", NULL);
+	strvec_pushl(&argv, "fetch", "--append", "--no-auto-gc",
+		     "--no-write-commit-graph", NULL);
 	add_options_to_argv(&argv);
 
 	if (max_children != 1 && list->nr != 1) {
-		struct parallel_fetch_state state = { argv.argv, list, 0, 0 };
+		struct parallel_fetch_state state = { argv.v, list, 0, 0 };
 
-		argv_array_push(&argv, "--end-of-options");
+		strvec_push(&argv, "--end-of-options");
 		result = run_processes_parallel_tr2(max_children,
 						    &fetch_next_remote,
 						    &fetch_failed_to_start,
@@ -1620,17 +1631,17 @@ static int fetch_multiple(struct string_list *list, int max_children)
 	} else
 		for (i = 0; i < list->nr; i++) {
 			const char *name = list->items[i].string;
-			argv_array_push(&argv, name);
+			strvec_push(&argv, name);
 			if (verbosity >= 0)
 				printf(_("Fetching %s\n"), name);
-			if (run_command_v_opt(argv.argv, RUN_GIT_CMD)) {
+			if (run_command_v_opt(argv.v, RUN_GIT_CMD)) {
 				error(_("Could not fetch %s"), name);
 				result = 1;
 			}
-			argv_array_pop(&argv);
+			strvec_pop(&argv);
 		}
 
-	argv_array_clear(&argv);
+	strvec_clear(&argv);
 	return !!result;
 }
 
@@ -1795,6 +1806,10 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 	if (depth || deepen_since || deepen_not.nr)
 		deepen = 1;
 
+	/* FETCH_HEAD never gets updated in --dry-run mode */
+	if (dry_run)
+		write_fetch_head = 0;
+
 	if (all) {
 		if (argc == 1)
 			die(_("fetch --all does not take a repository argument"));
@@ -1844,7 +1859,7 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 	}
 
 	if (!result && (recurse_submodules != RECURSE_SUBMODULES_OFF)) {
-		struct argv_array options = ARGV_ARRAY_INIT;
+		struct strvec options = STRVEC_INIT;
 		int max_children = max_jobs;
 
 		if (max_children < 0)
@@ -1860,7 +1875,7 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 						    recurse_submodules_default,
 						    verbosity < 0,
 						    max_children);
-		argv_array_clear(&options);
+		strvec_clear(&options);
 	}
 
 	string_list_clear(&list, 0);
@@ -1882,7 +1897,7 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 	close_object_store(the_repository->objects);
 
 	if (enable_auto_gc)
-		run_auto_gc(verbosity < 0);
+		run_auto_maintenance(verbosity < 0);
 
 	return result;
 }
